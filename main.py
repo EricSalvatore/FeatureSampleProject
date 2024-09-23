@@ -10,7 +10,7 @@ import argparse
 from torch.optim import Adam
 from pytorch_lightning.callbacks import ModelCheckpoint
 import numpy as np
-
+from DataModule.CIFAR10ImbalanceDataModule import CIFAR10ImbalanceDataModule
 
 class CIFAR10Classifier(LightningModule):
     def __init__(self):
@@ -61,7 +61,34 @@ class CIFAR10Classifier(LightningModule):
         return Adam(params=self.parameters(), lr=1e-4)
 
 
+class TwoStageCIFAR10Classifier(LightningModule):
+    def __init__(self, _args, _sim_geometric, _sorted_eigenvalues_list, _sorted_eigenvectors_list):
+        super(TwoStageCIFAR10Classifier, self).__init__()
+        self.args = _args
+        self.sim_geometric = _sim_geometric
+        self.sorted_eigenvalues_list = _sorted_eigenvalues_list
+        self.sorted_eigenvectors_list = _sorted_eigenvectors_list
 
+        self.feature_extractor = CIFAR10Classifier().model
+        self.classifer = CIFAR10Classifier().classifer
+
+    def forward(self, x, stage=0):
+        pass
+
+    def freeze_diff_stage(self, stage=0):
+        if stage == 0:
+            # 第二阶段 冻结feature_extractor
+            for param in self.feature_extractor.parameters():
+                param.requires_grad = False
+            for param in self.classifer.parameters():
+                param.requires_grad = True
+
+        if stage == 1:
+            # 第三阶段 冻结classifer
+            for param in self.feature_extractor.parameters():
+                param.requires_grad = True
+            for param in self.classifer.parameters():
+                param.requires_grad = False
 
 
 def train(args):
