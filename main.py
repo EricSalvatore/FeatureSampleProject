@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 import argparse
 from torch.optim import Adam
 from pytorch_lightning.callbacks import ModelCheckpoint
+import numpy as np
 
 
 class CIFAR10Classifier(LightningModule):
@@ -60,6 +61,9 @@ class CIFAR10Classifier(LightningModule):
         return Adam(params=self.parameters(), lr=1e-4)
 
 
+
+
+
 def train(args):
     # 训练模型
     model = CIFAR10Classifier()
@@ -84,9 +88,10 @@ def train(args):
 if __name__ == '__main__':
     parse = argparse.ArgumentParser(description="cifar10")
     parse.add_argument("--data_dir", default='./data', type=str, help="data_cifar 10 dir")
-    parse.add_argument("--batch_size", default=2, type=int, help="batch size")
+    parse.add_argument("--batch_size", default=24, type=int, help="batch size")
     parse.add_argument("--train", default=False, type=bool, help="whether is train process")
     parse.add_argument("--checkpoint", default='./checkpoint', type=str, help="checkpoint path")
+    parse.add_argument("--num_classes", default=10, type=int, help="number of classes")
 
     args = parse.parse_args()
 
@@ -107,69 +112,104 @@ if __name__ == '__main__':
 
     if args.train is True:
         train(args)
-
-    model = CIFAR10Classifier()
     # 获取已经保存好的模型
-    model.load_from_checkpoint("./")
+    model = CIFAR10Classifier.load_from_checkpoint("./checkpoint/best-checkpoint.ckpt").cuda()
+    # # 验证当前模型 计算与类别C最相似的类别Y
+    model.eval()
+    # # 保存每一个样本的pred
+    pred_all = []
+    label_all = []
+    logits_all = []
+    # # 验证
+    with torch.no_grad():
+        for image, label in cifar10_train_dataloader:
+            image = image.cuda()
+            label = label.cuda()
+            pred, logits = model(image)
+            pred_all.append(pred)
+            label_all.append(label)
+            logits_all.append(logits)
 
-    #  获取模型 计算与类别C最相似的类别Y
-    ##
-    # model.eval()
-    #
-    # ## 保存每一个样本的pred和label
-    # all_pred = []
-    # all_label = []
-    #
-    # with torch.no_grad():
-    #     for image, label in cifar10_train_dataloader:
-    #         pred, logits = model(image)
-    #         all_label.append(label)
-    #         all_pred.append(pred)
-    #
-    #
-    # print("")
+    # 将所有的logits合并为一个tensor
+    pred_all_tensor = torch.cat(pred_all, dim=0) # shape [num, num_class]
+    label_all_tensor = torch.cat(label_all, dim=0)
+    logits_all_tensor = torch.cat(logits_all, dim=0)
+
+    # 计算每一个类别的平均预测分数
+    average_scores = torch.zeros(args.num_classes, args.num_classes)
+
+    # 遍历每一个类别 计算该类别的平均预测分数
+    for c in range(args.num_classes):
+        class_mask = (label_all_tensor == c)
+        class_logits = pred_all_tensor[class_mask] # 当前类别所有的logits
+        # 计算所有logits的平均值
+        average_avg_scores = class_logits.mean(dim=0)
+        average_scores[c] = average_avg_scores
+
+    # 寻找最相似的类别（除了当前类别之外，平均logit分数最大的类别）
+    most_sim_classes = []
+    for c in range(args.num_classes):
+        avg_scores_c = average_scores[c]
+        avg_scores_c[c] = float('-inf')# 当前类别置为负无穷大，不参与比较
+        most_similar_class = torch.argmax(avg_scores_c).item()# 最相似类别
+        most_sim_classes.append(most_similar_class)
+        print(f"Class {c} is most similar to class {most_similar_class}")
+
+    print("Most similar classes for each class:", most_sim_classes)
+
+    # 相似类的logits集合 后续利用它们指导尾部类的分布恢复
+    sim_logits_matrix = [] # [[shape(m, 128), shape(n, 128)],...]
+
+    for c in range(args.num_classes):
+        class_mask = (label_all_tensor == c)
+        class_sim_mask = (label_all_tensor == most_sim_classes[c])
+        src_class_logits = logits_all_tensor[class_mask]
+        tar_class_logits = logits_all_tensor[class_sim_mask]
+        print(f"\nclass {c} is src_class_logits : {src_class_logits.shape}, tar_class_logits : {tar_class_logits.shape}")
+        sim_logits_matrix.append([src_class_logits, tar_class_logits])
+
+    # 计算他们的协方差矩阵
+    sim_geometric = [] # 存储相似度
+    sorted_eigenvalues_list = [] # 类别C的特征值[[values], [values],...]
+    sorted_eigenvectors_list = [] # 类别c的特征向量 [[128, 128], [128, 128], ...]
+    for c in range(args.num_classes):
+        src_class_logits = sim_logits_matrix[c][0]
+        tar_class_logits = sim_logits_matrix[c][1]
+
+        # 计算协方差矩阵
+        src_covariance_matrix = np.cov(src_class_logits.cpu(), rowvar=False)
+        tar_covariance_matrix = np.cov(tar_class_logits.cpu(), rowvar=False)
+
+        print(f"\nclass {c} is src_covariance_matrix : {src_covariance_matrix.shape}, tar_covariance_matrix : {tar_covariance_matrix.shape}")
+        # 进行特征值分解
+        src_eigenvalues, src_eigenvectors = np.linalg.eigh(src_covariance_matrix)
+        tar_eigenvalues, tar_eigenvectors = np.linalg.eigh(tar_covariance_matrix)
+        # print(f"\n src_eigenvalues = {src_eigenvalues}, src_eigenvectors = {src_eigenvectors.shape}")
+        # print(f"\n tar_eigenvalues = {tar_eigenvalues}, tar_eigenvectors = {tar_eigenvectors.shape}")
+
+        # 对特征值进行排序
+        src_sorted_indices = np.argsort(src_eigenvalues)[::-1]
+        src_eigenvalues = src_eigenvalues[src_sorted_indices]
+        src_eigenvectors = src_eigenvectors[:, src_sorted_indices]
+        # 存储排序以后的特征值和特征向量
+        sorted_eigenvalues_list.append(src_eigenvalues)
+        sorted_eigenvectors_list.append(src_eigenvectors)
+
+        src_sorted_indices = np.argsort(tar_eigenvalues)[::-1]
+        tar_eigenvalues = tar_eigenvalues[src_sorted_indices]
+        tar_eigenvectors = tar_eigenvectors[:, src_sorted_indices]
+
+        print("sorted")
+        similarity = 0
+        for i in range(len(tar_eigenvectors)):
+            similarity += np.abs(np.dot(src_eigenvectors[:, i].T, tar_eigenvectors[:, i]))
+        sim_geometric.append(similarity)
+        print("Similarity of the geometric shapes of the two perceptual manifolds:", similarity)
+
+    print(f"similarity of geometric list {sim_geometric}")
+
+
+    ###################第二阶段 重塑决策边界############################
 
 
 
-    # # 使用预训练的ResNet-18模型
-    # model = models.resnet18(pretrained=True)
-    # model.eval()
-    #
-    # # 2. 保存每个样本的logit和标签
-    # all_logits = []
-    # all_labels = []
-    #
-    # with torch.no_grad():
-    #     for images, labels in data_loader:
-    #         logits = model(images)  # 模型输出的logits
-    #         all_logits.append(logits)
-    #         all_labels.append(labels)
-    #
-    # # 将所有batch的logit和标签合并到一个tensor中
-    # all_logits = torch.cat(all_logits, dim=0)  # shape: (num_samples, num_classes)
-    # all_labels = torch.cat(all_labels, dim=0)  # shape: (num_samples, )
-    #
-    # # 3. 计算每个类别的平均预测分数
-    # num_classes = 10  # CIFAR-10有10个类别
-    # average_scores = torch.zeros(num_classes, num_classes)  # shape: (num_classes, num_classes)
-    #
-    # # 遍历每个类别，计算该类别的平均logit分数
-    # for c in range(num_classes):
-    #     class_mask = (all_labels == c)  # 当前类别的mask
-    #     class_logits = all_logits[class_mask]  # 当前类别的所有logit
-    #     class_avg_scores = class_logits.mean(dim=0)  # 计算所有logit的平均值
-    #     average_scores[c] = class_avg_scores
-    #
-    # # 4. 寻找最相似的类别（除了当前类别之外，平均logit分数最大的类别）
-    # most_similar_classes = []
-    #
-    # for c in range(num_classes):
-    #     avg_scores_c = average_scores[c]  # 当前类别的平均logit分数
-    #     # 排除当前类别，找出其他类别中logit分数最大的类别
-    #     avg_scores_c[c] = float('-inf')  # 当前类别置为负无穷大，不参与比较
-    #     most_similar_class = torch.argmax(avg_scores_c).item()  # 最相似类别
-    #     most_similar_classes.append(most_similar_class)
-    #     print(f"Class {c} is most similar to class {most_similar_class}")
-    #
-    # # 输出每个类别最相似的类别
-    # print("Most similar classes for each class:", most_similar_classes)
