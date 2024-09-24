@@ -98,9 +98,9 @@ class CIFAR10ImbalanceDataModule(LightningDataModule):
         # 创建不平衡数据集
         self.train_datasets = full_train_dataset
         self.test_datasets = val_dataset
-        print(f"self.train_datasets: {self.train_datasets.__len__()}")
-        print(f"self.tail_class_indices: {len(self.tail_class_indices)}")
-        print(f"self.head_class_indices: {len(self.head_class_indices)}")
+        # print(f"self.train_datasets: {self.train_datasets.__len__()}")
+        # print(f"self.tail_class_indices: {len(self.tail_class_indices)}")
+        # print(f"self.head_class_indices: {len(self.head_class_indices)}")
 
     def train_dataloader(self):
         sampler = CIFAR10Sampler(self.tail_class_indices, self.head_class_indices, self.nt, self.na)
