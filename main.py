@@ -65,21 +65,26 @@ class TwoStageCIFAR10Classifier(LightningModule):
     def __init__(self, _args, _sim_geometric, _sorted_eigenvalues_list, _sorted_eigenvectors_list, tail_classes):
         super(TwoStageCIFAR10Classifier, self).__init__()
         self.args = _args
-        self.sim_geometric = _sim_geometric
-        self.sorted_eigenvalues_list = _sorted_eigenvalues_list
-        self.sorted_eigenvectors_list = _sorted_eigenvectors_list
+        self.sim_geometric = _sim_geometric # [] 10个 float
+        # print(f"self.sim_geometric : {self.sim_geometric}")
+        self.sorted_eigenvalues_list = _sorted_eigenvalues_list # [10个] array
+        # print(f"self.sorted_eigenvalues_list: {len(self.sorted_eigenvalues_list)}")
+        self.sorted_eigenvectors_list = _sorted_eigenvectors_list # [10个] array
+        # print(f"self.sorted_eigenvectors_list: {len(self.sorted_eigenvectors_list)}")
         self.tail_classes = tail_classes
+        # print(f"self.tail_classes; {self.tail_classes}")
 
         self.feature_extractor = CIFAR10Classifier().model
         self.classifer = CIFAR10Classifier().classifer
 
-    def forward(self, x, stage=0):
-        # 确定训练阶段
-        self.freeze_diff_stage(stage)
+        self.criterion = nn.CrossEntropyLoss()
+
+    def forward(self, x):
         # 前馈过程
-        logits = self.feature_extractor(x)
-        output = self.classifer(logits)
-        return output, logits
+        # logits = self.feature_extractor(x)
+        print(f"x shape : {x.shape}")
+        output = self.classifer(x)
+        return output
 
     def freeze_diff_stage(self, stage=0):
         if stage == 0:
@@ -97,26 +102,55 @@ class TwoStageCIFAR10Classifier(LightningModule):
                 param.requires_grad = False
 
     # 不确定性表示函数
-    def feature_uncertainty_representation(self, x, index):
+    def feature_uncertainty_representation(self, x, c):
         """
-           根据特征向量和特征值，对给定特征进行不确定性表示
+           根据特征向量和特征值，对给定特征进行不确定性表示 获得增强之后的特征表示
+           输入：x 之前的特征表征 c类别 label
+           x [batch_size(15), 128] nt个尾部数据 nt(1+na)个头部数据 nt 3 na 2
+           每一个尾部数据跟着na个头部数据
+           尾部 0 1 2
+           index: class c
         """
+        nt = self.args.nt
         perturbed_features = []
-        for _ in range(self.args.na):
-            epsilon = np.random.normal(0, 1, self.sorted_eigenvalues_list[index].shape)
-            perturbed_value = np.dot(self.sorted_eigenvectors_list[index], epsilon * self.sorted_eigenvalues_list[index])
-            perturbed_feature = x + perturbed_value
-            perturbed_features.append(perturbed_feature)
-        return perturbed_features
-
+        for i in range(nt):
+            tail_feature = x[i]
+            epsilon = np.random.normal(0, 1, self.sorted_eigenvalues_list[c[i]].shape)
+            perturbed_value = np.dot(self.sorted_eigenvectors_list[c[i]], epsilon * self.sorted_eigenvalues_list[c[i]])
+            perturbed_value_tensor = tail_feature + torch.tensor(perturbed_value).cuda()
+            perturbed_features.append(perturbed_value_tensor.unsqueeze(0))
+        return torch.cat([torch.cat(perturbed_features, dim=0), x[nt:]],dim=0)
 
     def training_step(self, batch, batch_idx):
         images, labels = batch
-        # 获取原始logits
-        for image, label in zip(images, labels):
-            with torch.no_grad():
-                original_logits = self.feature_extractor(image)
-            
+        with torch.no_grad():
+            original_logits = self.feature_extractor(images) # [bs(15), 128] nt个尾部 nt(1+na)个为头部数据
+        # 确定训练阶段
+        self.freeze_diff_stage()
+        perturbed_features = self.feature_uncertainty_representation(original_logits, label)
+        perturbed_features = perturbed_features.to(torch.float32)
+        output = self(perturbed_features)
+        loss = self.criterion(output, labels)
+        self.log("train_loss", loss)
+        print(f"\ntrain_loss is {loss}")
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        input, labels = batch
+        with torch.no_grad():
+            original_logits = self.feature_extractor(input) # [bs(15), 128] nt个尾部 nt(1+na)个为头部数据
+        pred = self(original_logits)
+        loss = self.criterion(pred, labels)
+        acc = (pred.argmax(dim=1) == labels).float().mean()
+
+        self.log("val_loss", loss)
+        print(f"\nval_loss is {loss}")
+        self.log("acc", acc)
+        print(f"\nacc is {acc}")
+
+    def configure_optimizers(self):
+        return Adam(params=self.parameters(), lr=1e-4)
+
 
 
 def train(args):
@@ -282,6 +316,24 @@ if __name__ == '__main__':
 
 
     ###################第二阶段 重塑决策边界############################
+    finetuning_model = TwoStageCIFAR10Classifier(_args=args, _sim_geometric=sim_geometric,
+                                                 _sorted_eigenvalues_list=sorted_eigenvalues_list,
+                                                 _sorted_eigenvectors_list=sorted_eigenvectors_list,
+                                                 tail_classes=tail_classes)
 
+    cifar10_lt_dataset = CIFAR10ImbalanceDataModule(tail_classes=tail_classes)
+    cifar10_lt_dataset.prepare_data()
+    cifar10_lt_dataset.setup()
 
+    # 创建 ModelCheckpoint 回调
+    checkpoint_callback2 = ModelCheckpoint(
+        monitor='acc',  # 监控的指标
+        dirpath=r'./tuning_checkpoint',  # 保存路径
+        filename='best-checkpoint',  # 文件名模板
+        save_top_k=1,  # 保存验证集最优的 k 个模型
+        mode='max'  # 当 'val_loss' 越小越好时为 'min', 否则为 'max'
+    )
 
+    # trainer = Trainer(max_epochs=3)
+    trainer = Trainer(max_epochs=20, accelerator='gpu', callbacks=[checkpoint_callback2])
+    trainer.fit(finetuning_model, cifar10_lt_dataset)

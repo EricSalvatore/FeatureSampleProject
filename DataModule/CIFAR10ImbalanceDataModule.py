@@ -20,18 +20,23 @@ class CIFAR10Sampler(Sampler):
     def __iter__(self):
         np.random.shuffle(self.tail_indices)
         np.random.shuffle(self.head_indices)
-
+        head_length = len(self.head_indices)
+        # print(f"self.num_batches: {self.num_batches}")
         for i in range(self.num_batches):
             # 从尾部采样nt个数据
             tail_batch = self.tail_indices[i * self.nt:(i + 1) * self.nt]
+            # print(f"i: {i}, tail_batch: {tail_batch}")
 
             # 从头部数据采样nt(1+na)个数据
-            head_start_idx = i * self.nt * (1 + self.na)
-            head_end_idx = (i + 1) * self.nt * (1 + self.na)
-            head_batch = self.head_indices[head_start_idx:head_end_idx]
-
+            # 计算头部类样本的开始和结束索引
+            head_start_idx = (i * self.nt * (1 + self.na)) % head_length
+            head_samples = []
+            for j in range(self.nt * (1 + self.na)):
+                # 使用取模运算实现环形访问
+                head_index = (head_start_idx + j) % head_length
+                head_samples.append(self.head_indices[head_index])
             # 组合为一个batch
-            yield list(tail_batch) + list(head_batch)
+            yield from [int(idx) for idx in tail_batch + head_samples]
 
     def __len__(self):
         return self.num_batches
@@ -40,12 +45,11 @@ class CIFAR10Sampler(Sampler):
 # 设定类别0 1 2 3 4为尾部类
 # 构建CIFAR10的尾部类数据
 class CIFAR10ImbalanceDataModule(LightningDataModule):
-    def __init__(self, batch_size, tail_classes, tail_ratio=0.1, data_dir='./data', nt=3, na=3):
+    def __init__(self, tail_classes, tail_ratio=0.1, data_dir='./data', nt=3, na=3):
         super().__init__()
         self.data_dir = data_dir
         self.tail_classes = tail_classes # [0, 1, 2, 3, 4]
         self.tail_ratio = tail_ratio
-        self.batch_size = batch_size
         self.nt = nt
         self.na = na
 
@@ -92,8 +96,11 @@ class CIFAR10ImbalanceDataModule(LightningDataModule):
         np.random.shuffle(imbalanced_indices)  # 打乱样本索引
 
         # 创建不平衡数据集
-        self.train_datasets = Subset(full_train_dataset, imbalanced_indices)
+        self.train_datasets = full_train_dataset
         self.test_datasets = val_dataset
+        print(f"self.train_datasets: {self.train_datasets.__len__()}")
+        print(f"self.tail_class_indices: {len(self.tail_class_indices)}")
+        print(f"self.head_class_indices: {len(self.head_class_indices)}")
 
     def train_dataloader(self):
         sampler = CIFAR10Sampler(self.tail_class_indices, self.head_class_indices, self.nt, self.na)
@@ -101,7 +108,6 @@ class CIFAR10ImbalanceDataModule(LightningDataModule):
 
     def val_dataloader(self):
         return DataLoader(self.test_datasets, batch_size=self.nt + self.nt * (1 + self.na), shuffle=False)
-
 
 
 
