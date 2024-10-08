@@ -4,53 +4,65 @@ import numpy as np
 
 # 寻找最相似的类别（除了当前类别之外，平均logit分数最大的别的非当前头（尾部）类别）
 def search_most_similar_class(args, pred_all_tensor, label_all_tensor, logits_all_tensor):
-    tail_classes = args.tail_classes
-    # 计算每一个类别的平均预测分数
-    average_scores = torch.zeros(args.num_classes, args.num_classes)
+    if args.is_lt is True:
+        # 使用长尾数据
+        tail_classes = args.tail_classes
+        # 计算每一个类别的平均预测分数
+        average_scores = torch.zeros(args.num_classes, args.num_classes)
 
-    # 遍历每一个类别 计算该类别的平均预测分数
-    for c in range(args.num_classes):
-        class_mask = (label_all_tensor == c)
-        class_logits = pred_all_tensor[class_mask]  # 当前类别所有的logits
-        # 计算所有logits的平均值
-        average_avg_scores = class_logits.mean(dim=0)
-        average_scores[c] = average_avg_scores
+        # 遍历每一个类别 计算该类别的平均预测分数
+        for c in range(args.num_classes):
+            class_mask = (label_all_tensor == c)
+            class_logits = pred_all_tensor[class_mask]  # 当前类别所有的logits
+            # 计算所有logits的平均值
+            average_avg_scores = class_logits.mean(dim=0)
+            average_scores[c] = average_avg_scores
 
-    # 寻找最相似的类别（除了当前类别之外，平均logit分数最大的别的非当前头（尾部）类别）
-    most_sim_classes = []
-    for c in range(args.num_classes):
-        avg_scores_c = average_scores[c]
-        avg_scores_c[c] = float('-inf')  # 当前类别置为负无穷大，不参与比较
-        if c in tail_classes:
-            # c是尾部类，将所有尾部类设置为负无穷大 不参与比较
-            for c_idx in range(args.num_classes):
-                if c_idx in tail_classes:
-                    avg_scores_c[c_idx] = float('-inf')
-        else:
-            # c是头部类，将所有的头部类都设置为负无穷大 不参与比较
-            for c_idx in range(args.num_classes):
-                if c_idx not in tail_classes:
-                    avg_scores_c[c_idx] = float('-inf')
-        most_similar_class = torch.argmax(avg_scores_c).item()  # 最相似类别
-        most_sim_classes.append(most_similar_class)
-        print(f"Class {c} is most similar to class {most_similar_class}")
+        # 寻找最相似的类别（除了当前类别之外，平均logit分数最大的别的非当前头（尾部）类别）
+        most_sim_classes = []
+        for c in range(args.num_classes):
+            avg_scores_c = average_scores[c]
+            avg_scores_c[c] = float('-inf')  # 当前类别置为负无穷大，不参与比较
+            if c in tail_classes:
+                # c是尾部类，将所有尾部类设置为负无穷大 不参与比较
+                for c_idx in range(args.num_classes):
+                    if c_idx in tail_classes:
+                        avg_scores_c[c_idx] = float('-inf')
+            else:
+                # c是头部类，将所有的头部类都设置为负无穷大 不参与比较
+                for c_idx in range(args.num_classes):
+                    if c_idx not in tail_classes:
+                        avg_scores_c[c_idx] = float('-inf')
+            most_similar_class = torch.argmax(avg_scores_c).item()  # 最相似类别
+            most_sim_classes.append(most_similar_class)
+            print(f"Class {c} is most similar to class {most_similar_class}")
 
-    print("Most similar classes for each class:", most_sim_classes)
+        print("Most similar classes for each class:", most_sim_classes)
+        return most_sim_classes
+    else:
+        # 不使用长尾数据
+        # 计算每一个类别的平均预测分数
+        average_scores = torch.zeros(args.num_classes, args.num_classes)
 
-    # 相似类的logits集合 后续利用它们指导尾部类的分布恢复
-    # [[logits_1, logits_2], ...]
-    # 如果是头部类 logits_1 是头部类 logits_2 是尾部类；
-    # 如果是尾部类 logits_1 是尾部类 logits_2 是头部类
-    sim_logits_matrix = []  # [[shape(m, 128), shape(n, 128)],...]
-    for c in range(args.num_classes):
-        class_mask = (label_all_tensor == c)
-        class_sim_mask = (label_all_tensor == most_sim_classes[c])
-        src_class_logits = logits_all_tensor[class_mask]
-        tar_class_logits = logits_all_tensor[class_sim_mask]
-        # print(f"class {c} is src_class_logits : {src_class_logits.shape}, tar_class_logits : {tar_class_logits.shape}")
-        sim_logits_matrix.append([src_class_logits, tar_class_logits])
+        # 遍历每一个类别 计算该类别的平均预测分数
+        for c in range(args.num_classes):
+            class_mask = (label_all_tensor == c)
+            class_logits = pred_all_tensor[class_mask]  # 当前类别所有的logits
+            # 计算所有logits的平均值
+            average_avg_scores = class_logits.mean(dim=0)
+            average_scores[c] = average_avg_scores
 
-    return most_sim_classes
+        # 寻找最相似的类别（除了当前类别之外，平均logit分数最大的别的非当前头（尾部）类别）
+        most_sim_classes = []
+        for c in range(args.num_classes):
+            avg_scores_c = average_scores[c]
+            avg_scores_c[c] = float('-inf')  # 当前类别置为负无穷大，不参与比较
+            most_similar_class = torch.argmax(avg_scores_c).item()  # 最相似类别
+            most_sim_classes.append(most_similar_class)
+            print(f"Class {c} is most similar to class {most_similar_class}")
+
+        # print("Most similar classes for each class:", most_sim_classes)
+        return most_sim_classes
 
 # 计算与目标类别最相似的类别的所有特征值、所有特征向量、几何相似度
 # 这里后续计算不需要用到几何相似度，原因作者已经验证：我们已经使用了类别相似度来获得最相似的类别
@@ -58,6 +70,7 @@ def search_most_similar_class(args, pred_all_tensor, label_all_tensor, logits_al
 def get_eigenvalues_and_eigenvectors_and_sim_geometric(args, most_sim_classes, label_all_tensor, logits_all_tensor):
     # 相似类的logits集合 后续利用它们指导尾部类的分布恢复 如果是头部类 则0 是头部类 1 是尾部类；
     # 如果是尾部类 则0 是尾部类 1是头部类
+    # 版本2 此处不管是是否使用长尾数据 不影响操作
     sim_logits_matrix = []  # [[shape(m, 128), shape(n, 128)],...]
     for c in range(args.num_classes):
         class_mask = (label_all_tensor == c)

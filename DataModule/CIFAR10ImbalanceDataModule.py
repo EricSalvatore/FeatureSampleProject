@@ -104,10 +104,10 @@ class CIFAR10ImbalanceDataModule(LightningDataModule):
 
     def train_dataloader(self):
         sampler = CIFAR10Sampler(self.tail_class_indices, self.head_class_indices, self.nt, self.na)
-        return DataLoader(self.train_datasets, batch_size=self.nt + self.nt * (1 + self.na), sampler=sampler)
+        return DataLoader(self.train_datasets, batch_size=self.nt + self.nt * (1 + self.na), sampler=sampler, drop_last=True)
 
     def val_dataloader(self):
-        return DataLoader(self.test_datasets, batch_size=self.nt + self.nt * (1 + self.na), shuffle=False)
+        return DataLoader(self.test_datasets, batch_size=self.nt + self.nt * (1 + self.na), shuffle=False, drop_last=True)
 
 
 

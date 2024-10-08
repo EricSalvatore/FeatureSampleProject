@@ -1,1 +1,11 @@
 data/
+checkpoint/
+clip_checkpoint/
+clip_seg_checkpoint/
+clip_tuning_checkpoint/
+downloaded_model/
+lightning_logs/
+res_seg_img/
+seg_checkpoint/
+seg_res_checkpoint/
+seg_res_checkpoint_tuning/

@@ -1,10 +1,15 @@
+import sys
+from os import system
 import pytorch_lightning as pl
 from pytorch_lightning import LightningModule, Trainer
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import transforms
 import torchvision
+from torchmetrics import MeanMetric
+from torchvision import transforms
+from torchvision import models
+
 from torch.utils.data import DataLoader
 import argparse
 from torch.optim import Adam
@@ -15,26 +20,21 @@ import DurModule
 from DataModule.CIFAR10ImbalanceDataModule import CIFAR10ImbalanceDataModule
 
 class CIFAR10Classifier(LightningModule):
-    def __init__(self):
+    def __init__(self, _model):
         super(CIFAR10Classifier, self).__init__()
-        self.model = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2, padding=0),
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2, padding=0),
-            nn.Flatten(),
-            nn.Linear(64 * 8 * 8, 128),
-            nn.ReLU()
-        )
+        # self.model = _model
+        self.model_feature_extractor = nn.Sequential(*list(_model.children())[:-1]).cuda()
+        self.model_classifer = nn.Linear(in_features=_model.fc.weight.size(1), out_features=10).cuda()
 
-        self.classifer = nn.Linear(in_features=128, out_features=10)
+        # self.classifer = nn.Linear(in_features=128, out_features=10)
+        self.avg_acc = MeanMetric()
         self.criterion = nn.CrossEntropyLoss()
 
     def forward(self, x):
-        logits = self.model(x)
-        output = self.classifer(logits)
+        batch_size = x.size(0)
+        logits = self.model_feature_extractor(x)
+        logits = logits.view(batch_size, -1)
+        output = self.model_classifer(logits)
         return output, logits
 
     def training_step(self, batch, batch_idx):
@@ -42,7 +42,7 @@ class CIFAR10Classifier(LightningModule):
         output, _ = self(input)
         loss = self.criterion(output, labels)
         self.log("train_loss", loss)
-        print(f"\ntrain_loss is {loss:.4f}")
+        print(f"train_loss is {loss:.4f}")
         return loss
 
     def test_step(self, batch, batch_idx):
@@ -56,15 +56,23 @@ class CIFAR10Classifier(LightningModule):
 
         self.log("val_loss", loss)
         print(f"val_loss is {loss:.4f}")
+        self.avg_acc(acc)
         self.log("acc", acc)
         print(f"acc is {acc:.4f}")
+
+    def on_validation_epoch_end(self):
+        avg_acc = self.avg_acc.compute()
+        print(f"avg acc is {avg_acc}")
+        self.log("avg_acc", avg_acc)
+        self.avg_acc.reset()
+
 
     def configure_optimizers(self):
         return Adam(params=self.parameters(), lr=1e-4)
 
 
 class TwoStageCIFAR10Classifier(LightningModule):
-    def __init__(self, _args, _sim_geometric, _sorted_eigenvalues_list, _sorted_eigenvectors_list, tail_classes):
+    def __init__(self, _args, _model, _sim_geometric, _sorted_eigenvalues_list, _sorted_eigenvectors_list, tail_classes):
         super(TwoStageCIFAR10Classifier, self).__init__()
         self.args = _args
         self.sim_geometric = _sim_geometric # [] 10个 float
@@ -76,15 +84,18 @@ class TwoStageCIFAR10Classifier(LightningModule):
         self.tail_classes = tail_classes
         # print(f"self.tail_classes; {self.tail_classes}")
 
-        self.feature_extractor = CIFAR10Classifier().model
-        self.classifer = CIFAR10Classifier().classifer
+        self.feature_extractor = _model.model_feature_extractor
+        self.classifer = _model.model_classifer
 
         self.criterion = nn.CrossEntropyLoss()
+        self.avg_acc = MeanMetric()
 
     def forward(self, x):
         # 前馈过程
         # logits = self.feature_extractor(x)
         # print(f"x shape : {x.shape}")
+        batch_size = x.size(0)
+        x = x.view(batch_size, -1)
         output = self.classifer(x)
         return output
 
@@ -129,6 +140,7 @@ class TwoStageCIFAR10Classifier(LightningModule):
             original_logits = self.feature_extractor(images) # [bs(15), 128] nt个尾部 nt(1+na)个为头部数据
         # 确定训练阶段
         self.freeze_diff_stage()
+        original_logits = original_logits.view(images.size(0), -1)
         perturbed_features = self.feature_uncertainty_representation(original_logits, label)
         perturbed_features = perturbed_features.to(torch.float32)
         output = self(perturbed_features)
@@ -141,6 +153,7 @@ class TwoStageCIFAR10Classifier(LightningModule):
         input, labels = batch
         with torch.no_grad():
             original_logits = self.feature_extractor(input) # [bs(15), 128] nt个尾部 nt(1+na)个为头部数据
+        original_logits = original_logits.view(input.size(0), -1)
         pred = self(original_logits)
         loss = self.criterion(pred, labels)
         acc = (pred.argmax(dim=1) == labels).float().mean()
@@ -149,6 +162,13 @@ class TwoStageCIFAR10Classifier(LightningModule):
         print(f"val_loss is {loss:.4f}")
         self.log("acc", acc)
         print(f"acc is {acc:.4f}")
+        self.avg_acc(acc)
+
+    def on_validation_epoch_end(self):
+        avg_acc_value = self.avg_acc.compute()
+        print(f"avg_acc_value is {avg_acc_value}")
+        self.log("avg_acc", avg_acc_value)
+        self.avg_acc.reset()
 
     def configure_optimizers(self):
         return Adam(params=self.parameters(), lr=1e-4)
@@ -157,30 +177,43 @@ class TwoStageCIFAR10Classifier(LightningModule):
 
 def train(args):
     # 训练模型
-    model = CIFAR10Classifier()
+    # 使用restnet18
+    pretrained_model = models.resnet18(pretrained=True)
+    model = CIFAR10Classifier(_model=pretrained_model)
 
     print(f"torch_gpu is aviliable : {torch.cuda.is_available()}")
 
     # todo: 将训练好的模型保存
     # 创建 ModelCheckpoint 回调
     checkpoint_callback = ModelCheckpoint(
-        monitor='acc',  # 监控的指标
+        monitor='avg_acc',  # 监控的指标
         dirpath=r'./checkpoint',  # 保存路径
-        filename='best-checkpoint',  # 文件名模板
+        filename=f'best-{args.model_name}-checkpoint-epoch-{args.pretrained_epoch}-best-acc-'+'{avg_acc:.3f}',  # 文件名模板
         save_top_k=1,  # 保存验证集最优的 k 个模型
         mode='max'  # 当 'val_loss' 越小越好时为 'min', 否则为 'max'
     )
 
-    trainer = Trainer(max_epochs=3, callbacks=[checkpoint_callback])
+    trainer = Trainer(max_epochs=args.pretrained_epoch, accelerator='gpu', callbacks=[checkpoint_callback])
     # trainer = Trainer(max_epochs=20, accelerator='gpu')
+    cifar10_lt_dataloader = CIFAR10ImbalanceDataModule(tail_classes=args.tail_classes)
+    # todo:长尾数据开关
     trainer.fit(model, cifar10_train_dataloader, cifar10_test_dataloader)
+    # trainer.fit(model, cifar10_lt_dataloader)
 
 
 if __name__ == '__main__':
     parse = argparse.ArgumentParser(description="cifar10")
     parse.add_argument("--data_dir", default='./data', type=str, help="data_cifar 10 dir")
+    parse.add_argument("--model_name", default='resnet18', type=str, help="model name")
     parse.add_argument("--batch_size", default=24, type=int, help="batch size")
-    parse.add_argument("--train", default=False, type=bool, help="whether is train process")
+    parse.add_argument("--pretrained_epoch", default=200, type=int, help="pretrained_epoch")
+    parse.add_argument("--tuning_epoch", default=100, type=int, help="tuning epoch")
+
+    # 开关
+    parse.add_argument("--train", default=True, type=bool, help="whether is train process")
+    parse.add_argument("--is_lt", default=False, type=bool, help="whether is is_lt dataset")
+    parse.add_argument("--end_train", default=True, type=bool, help="only pretrain")
+
     parse.add_argument("--checkpoint", default='./checkpoint', type=str, help="checkpoint path")
     parse.add_argument("--num_classes", default=10, type=int, help="number of classes")
     parse.add_argument("--nt", default=3, type=int, help="nt for tail_num")
@@ -188,6 +221,9 @@ if __name__ == '__main__':
     parse.add_argument("--tail_classes", default=[0, 1, 2, 3, 4], type=int, help="each tail class")
 
     args = parse.parse_args()
+    pl.seed_everything(42)
+    # 指定下载路径
+    torch.hub.set_dir('./downloaded_model')  # 替换为你的下载路径
     # 尾部类
     tail_classes = args.tail_classes
     # 构建batch_size
@@ -212,9 +248,16 @@ if __name__ == '__main__':
 
     if args.train is True:
         train(args)
+
+    if args.end_train is True:
+        print(f"end file")
+        sys.exit()
     # 获取已经保存好的模型
-    model = CIFAR10Classifier.load_from_checkpoint("./checkpoint/best-checkpoint.ckpt").cuda()
+    # 获取模型
+    pretrained_model = models.resnet18(pretrained=True)
+    model = CIFAR10Classifier.load_from_checkpoint(f"./checkpoint/best-{args.model_name}-checkpoint.ckpt", _model=pretrained_model).cuda()
     # # 验证当前模型 计算与类别C最相似的类别Y
+    # model = CIFAR10Classifier()
     model.eval()
     # # 保存每一个样本的pred
     pred_all = []
@@ -237,7 +280,7 @@ if __name__ == '__main__':
 
     # 获取得到与之最相似的类别：示例：List  [8, 9, 5, 5, 7, 3, 3, 4, 0, 1]
     # 如果index是尾部类 则找到最相似的头部类 List[0] = 8： 尾部类0的最相似的头部类为8
-    # 如果index是头部类 则找到最相似的尾部类 List[5] = 3: 头部类5的最相似的尾部类为3
+    # 如果index是头部类 则找到最相似的尾部类 List[5] = 3: 头部类5的最相似mkkj的尾部类为3
     most_sim_classes = DurModule.search_most_similar_class(args=args, pred_all_tensor=pred_all_tensor,
                                         label_all_tensor=label_all_tensor,
                                         logits_all_tensor=logits_all_tensor)
@@ -252,7 +295,9 @@ if __name__ == '__main__':
                                                                        logits_all_tensor=logits_all_tensor)
 
     ###################第二阶段 重塑决策边界############################
-    finetuning_model = TwoStageCIFAR10Classifier(_args=args, _sim_geometric=sim_geometric,
+    # 获取模型
+    # pretrained_model = models.resnet18(pretrained=True)
+    finetuning_model = TwoStageCIFAR10Classifier(_args=args, _model=model, _sim_geometric=sim_geometric,
                                                  _sorted_eigenvalues_list=sorted_eigenvalues_list,
                                                  _sorted_eigenvectors_list=sorted_eigenvectors_list,
                                                  tail_classes=tail_classes)
@@ -263,13 +308,15 @@ if __name__ == '__main__':
 
     # 创建 ModelCheckpoint 回调
     checkpoint_callback2 = ModelCheckpoint(
-        monitor='acc',  # 监控的指标
+        monitor='avg_acc',  # 监控的指标
         dirpath=r'./tuning_checkpoint',  # 保存路径
-        filename='best-checkpoint',  # 文件名模板
+        filename='best-checkpoint-epoch-{epoch:03d}-acc-{avg_acc:.3f}',  # 文件名模板
         save_top_k=1,  # 保存验证集最优的 k 个模型
         mode='max'  # 当 'val_loss' 越小越好时为 'min', 否则为 'max'
     )
 
     # trainer = Trainer(max_epochs=3)
-    trainer = Trainer(max_epochs=20, accelerator='gpu', callbacks=[checkpoint_callback2])
-    trainer.fit(finetuning_model, cifar10_lt_dataset)
+    trainer = Trainer(max_epochs=args.tuning_epoch, accelerator='gpu', strategy='ddp_find_unused_parameters_true', callbacks=[checkpoint_callback2])
+    # todo: 长尾数据开关
+    # trainer.fit(finetuning_model, cifar10_lt_dataset)
+    trainer.fit(finetuning_model, cifar10_train_dataloader, cifar10_test_dataloader)
